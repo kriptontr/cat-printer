@@ -501,7 +501,7 @@ It supports multi-line text.</textarea>
     import { CatPrinter } from './dist/cat-printer.js';
 
     // Initialize printer
-    const printer = new CatPrinter({ debug: true });
+    const printer = new CatPrinter({ debug: true, mtu: 20, chunkDelay: 8, leadIn: 8, finishFeed: 80, lattice: false, startRetract: 40 });
 
     // Elements
     const statusEl = document.getElementById('status');

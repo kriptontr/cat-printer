@@ -49,3 +49,28 @@ export function rgbaToBits(
   }
   return bytes;
 }
+
+/**
+ * Encodes an integer as little-endian bytes.
+ * @param value The integer to encode. Values outside the range are clamped.
+ * @param length The number of bytes to produce. Default is 1.
+ * @returns The encoded bytes.
+ */
+export function intToBytes(value: number, length: number = 1): Uint8Array {
+  const max = 2 ** (8 * length) - 1;
+  let v = Math.max(0, Math.min(max, Math.round(value)));
+  const bytes = new Uint8Array(length);
+  for (let i = 0; i < length; i++) {
+    bytes[i] = v & 0xff;
+    v = Math.floor(v / 256);
+  }
+  return bytes;
+}
+
+/**
+ * Waits for the given number of milliseconds.
+ * @param ms The delay in milliseconds.
+ */
+export function delay(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}

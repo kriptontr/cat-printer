@@ -22,6 +22,32 @@ export interface PrinterOptions {
    * Default number of lines to feed after printing.
    */
   finishFeed?: number;
+  /**
+   * Maximum number of bytes sent in a single Bluetooth write. Commands are
+   * batched up to this size. Lower it (e.g. 20) if your printer produces
+   * garbled output. Default is 200.
+   */
+  mtu?: number;
+  /**
+   * Pause in milliseconds after every Bluetooth write. This keeps the
+   * printer's receive buffer from overflowing. Default is 20.
+   */
+  chunkDelay?: number;
+  /**
+   * Number of blank lines printed at the start of every job, so the printer
+   * does not cut off the top of the first item. Default is 16.
+   */
+  leadIn?: number;
+  /**
+   * Send the "update device" and lattice start/end commands around each job.
+   * Some printers (e.g. X5h) do not need them. Default is true.
+   */
+  lattice?: boolean;
+  /**
+   * Lines of paper to retract at the start of every job, to take back the
+   * blank paper left by the previous job's final feed. Default is 0.
+   */
+  startRetract?: number;
 }
 
 /**

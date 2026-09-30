@@ -11,6 +11,12 @@ import {
   DEF_SPEED,
   DEF_ENERGY,
   DEF_FINISH_FEED,
+  DEF_MTU,
+  DEF_CHUNK_DELAY,
+  DEF_LEAD_IN,
+  DEF_PAUSE_TIMEOUT,
+  LATTICE_START,
+  LATTICE_END,
 } from './constants';
 import { Command, CommandType } from './enums';
 import {
@@ -19,7 +25,7 @@ import {
   ImageOptions,
   PrinterState,
 } from './types';
-import { crc8, rgbaToBits } from './utils';
+import { crc8, rgbaToBits, intToBytes, delay } from './utils';
 import {
   ThresholdDithering,
   BayerDithering,
@@ -46,6 +52,11 @@ export class CatPrinter {
   };
   private options: PrinterOptions;
   private modelName: string = '';
+  /**
+   * Command bytes queued but not yet written to the printer.
+   * See {@link send} and {@link flush}.
+   */
+  private pending: number[] = [];
 
   /**
    * Creates an instance of the CatPrinter.
@@ -57,6 +68,11 @@ export class CatPrinter {
       speed: DEF_SPEED,
       energy: DEF_ENERGY,
       finishFeed: DEF_FINISH_FEED,
+      mtu: DEF_MTU,
+      chunkDelay: DEF_CHUNK_DELAY,
+      leadIn: DEF_LEAD_IN,
+      lattice: true,
+      startRetract: 0,
       ...options,
     };
   }
@@ -98,9 +114,8 @@ export class CatPrinter {
         this.handleNotification.bind(this)
       );
 
-      // Initialize printer
+      this.pending = [];
       await this.getDeviceState();
-      await this.prepare(this.options.speed!, this.options.energy!);
 
       return this.printerState;
     } catch (error) {
@@ -130,6 +145,7 @@ export class CatPrinter {
     this.server = null;
     this.txCharacteristic = null;
     this.rxCharacteristic = null;
+    this.pending = [];
     this.log('Disconnected from printer');
   }
 
@@ -151,50 +167,25 @@ export class CatPrinter {
 
   /**
    * Print text content.
+   * The printer is prepared before and finished (with the configured
+   * `finishFeed`) after the text.
    * @param text The text to print.
    * @param options Optional text formatting options.
    * @returns A Promise that resolves when printing is complete.
    * @throws Error if the printer is not connected.
    */
   async printText(text: string, options: TextOptions = {}): Promise<void> {
-    if (!this.isConnected()) {
-      throw new Error('Printer not connected');
-    }
+    this.assertConnected();
 
-    const defaultOptions: TextOptions = {
-      fontFamily: 'sans-serif',
-      fontSize: 16,
-      align: 'start',
-      lineSpacing: 8,
-      rotate: 0,
-      flipH: false,
-      flipV: false,
-      brightness: 128,
-      offset: 0,
-    };
-
-    const mergedOptions = { ...defaultOptions, ...options };
-
-    // Convert text to bitmap
-    const bitmapData = await this.textToBitmap(text, mergedOptions);
-
-    // Handle offset if specified
-    if (mergedOptions.offset && mergedOptions.offset !== 0) {
-      await this.setSpeed(8); // Slower speed for feeding
-      if (mergedOptions.offset > 0) {
-        await this.feed(mergedOptions.offset);
-      } else {
-        await this.retract(-mergedOptions.offset);
-      }
-      await this.setSpeed(this.options.speed!);
-    }
-
-    // Print the bitmap
-    await this.printBitmap(bitmapData);
+    await this.prepare(this.options.speed!, this.options.energy!);
+    await this.printTextContent(text, options);
+    await this.finish(this.options.finishFeed!);
   }
 
   /**
    * Print an image from a URL.
+   * The printer is prepared before and finished (with the configured
+   * `finishFeed`) after the image.
    * @param imageUrl The URL of the image to print.
    * @param options Optional image formatting options.
    * @returns A Promise that resolves when printing is complete.
@@ -204,41 +195,15 @@ export class CatPrinter {
     imageUrl: string,
     options: ImageOptions = {}
   ): Promise<void> {
-    if (!this.isConnected()) {
-      throw new Error('Printer not connected');
-    }
+    this.assertConnected();
 
-    const defaultOptions: ImageOptions = {
-      dither: 'bayer', // Default to Bayer dithering as suggested
-      rotate: 0,
-      flipH: false,
-      flipV: false,
-      brightness: 128,
-      offset: 0,
-    };
-
-    const mergedOptions = { ...defaultOptions, ...options };
-
-    // Convert image to bitmap
-    const bitmapData = await this.imageToBitmap(imageUrl, mergedOptions);
-
-    // Handle offset if specified
-    if (mergedOptions.offset && mergedOptions.offset !== 0) {
-      await this.setSpeed(8); // Slower speed for feeding
-      if (mergedOptions.offset > 0) {
-        await this.feed(mergedOptions.offset);
-      } else {
-        await this.retract(-mergedOptions.offset);
-      }
-      await this.setSpeed(this.options.speed!);
-    }
-
-    // Print the bitmap
-    await this.printBitmap(bitmapData);
+    await this.prepare(this.options.speed!, this.options.energy!);
+    await this.printImageContent(imageUrl, options);
+    await this.finish(this.options.finishFeed!);
   }
 
   /**
-   * Print multiple items (text or images) in sequence.
+   * Print multiple items (text or images) in sequence as a single job.
    * @param items An array of items to print, each with a type ('text' or 'image'), content, and optional options.
    * @returns A Promise that resolves when all items are printed.
    * @throws Error if the printer is not connected.
@@ -250,17 +215,21 @@ export class CatPrinter {
       options?: TextOptions | ImageOptions;
     }>
   ): Promise<void> {
-    if (!this.isConnected()) {
-      throw new Error('Printer not connected');
-    }
+    this.assertConnected();
 
     await this.prepare(this.options.speed!, this.options.energy!);
 
     for (const item of items) {
       if (item.type === 'text') {
-        await this.printText(item.content, item.options as TextOptions);
+        await this.printTextContent(
+          item.content,
+          (item.options as TextOptions) || {}
+        );
       } else if (item.type === 'image') {
-        await this.printImage(item.content, item.options as ImageOptions);
+        await this.printImageContent(
+          item.content,
+          (item.options as ImageOptions) || {}
+        );
       }
     }
 
@@ -274,13 +243,7 @@ export class CatPrinter {
    */
   async feed(lines: number): Promise<void> {
     if (lines <= 0) return;
-
-    const command = this.makeCommand(
-      Command.Feed,
-      new Uint8Array([lines & 0xff, (lines >> 8) & 0xff])
-    );
-
-    await this.write(command);
+    await this.transmit(Command.Feed, intToBytes(lines, 2));
   }
 
   /**
@@ -290,40 +253,25 @@ export class CatPrinter {
    */
   async retract(lines: number): Promise<void> {
     if (lines <= 0) return;
-
-    const command = this.makeCommand(
-      Command.Retract,
-      new Uint8Array([lines & 0xff, (lines >> 8) & 0xff])
-    );
-
-    await this.write(command);
+    await this.transmit(Command.Retract, intToBytes(lines, 2));
   }
 
   /**
    * Set the print speed.
-   * @param speed The print speed value.
+   * @param speed The print speed value (0-255, lower is faster).
    * @returns A Promise that resolves when the speed command is sent.
    */
   async setSpeed(speed: number): Promise<void> {
-    const command = this.makeCommand(Command.Speed, new Uint8Array([speed]));
-    await this.write(command);
+    await this.transmit(Command.Speed, intToBytes(speed, 1));
   }
 
   /**
    * Set the print energy/density.
-   * @param energy The energy value.
+   * @param energy The energy value (0-65535).
    * @returns A Promise that resolves when the energy command is sent.
    */
   async setEnergy(energy: number): Promise<void> {
-    const payload = new Uint8Array([
-      energy & 0xff,
-      (energy >> 8) & 0xff,
-      (energy >> 16) & 0xff,
-      (energy >> 24) & 0xff,
-    ]);
-
-    const command = this.makeCommand(Command.Energy, payload);
-    await this.write(command);
+    await this.transmit(Command.Energy, intToBytes(energy, 2));
   }
 
   /**
@@ -331,66 +279,123 @@ export class CatPrinter {
    * @returns A Promise that resolves when the apply energy command is sent.
    */
   async applyEnergy(): Promise<void> {
-    const command = this.makeCommand(Command.ApplyEnergy, new Uint8Array([1]));
-    await this.write(command);
+    await this.transmit(Command.ApplyEnergy, intToBytes(1, 1));
+  }
+
+  /**
+   * Set the print resolution to 200 DPI (the only mode supported).
+   * @returns A Promise that resolves when the command is sent.
+   */
+  async setDpi(): Promise<void> {
+    await this.transmit(Command.SetDpi, intToBytes(50, 1));
+  }
+
+  /**
+   * Ask the printer to apply its updated settings.
+   * @returns A Promise that resolves when the command is sent.
+   */
+  async updateDevice(): Promise<void> {
+    await this.transmit(Command.UpdateDevice, intToBytes(0, 1));
+  }
+
+  /**
+   * Send the "lattice start" sequence that has to precede bitmap data.
+   * @returns A Promise that resolves when the command is sent.
+   */
+  async startLattice(): Promise<void> {
+    await this.transmit(Command.Lattice, LATTICE_START);
+  }
+
+  /**
+   * Send the "lattice end" sequence that has to follow bitmap data.
+   * @returns A Promise that resolves when the command is sent.
+   */
+  async endLattice(): Promise<void> {
+    await this.transmit(Command.Lattice, LATTICE_END);
   }
 
   /**
    * Get the current device state from the printer.
-   * @returns A Promise that resolves with the current printer state.
+   * The state is updated asynchronously when the printer answers.
+   * @returns A Promise that resolves with the last known printer state.
    */
   async getDeviceState(): Promise<PrinterState> {
-    const command = this.makeCommand(
-      Command.GetDeviceState,
-      new Uint8Array([1])
-    );
-    await this.write(command);
+    await this.transmit(Command.GetDeviceState, intToBytes(0, 1));
     return this.printerState;
   }
 
   /**
-   * Prepare the printer for printing by setting speed and energy.
+   * Prepare the printer for a print job: query state, set DPI, speed and
+   * energy, and open the lattice so bitmap lines are accepted.
    * @param speed The print speed.
    * @param energy The print energy/density.
    * @returns A Promise that resolves when the prepare commands are sent.
    */
   async prepare(speed: number, energy: number): Promise<void> {
-    await this.setSpeed(speed);
-    await this.setEnergy(energy);
-    await this.applyEnergy();
+    await this.flush();
+    await this.queue(Command.GetDeviceState, intToBytes(0, 1));
+    await this.queue(Command.SetDpi, intToBytes(50, 1));
+    await this.queue(Command.Speed, intToBytes(speed, 1));
+    await this.queue(Command.Energy, intToBytes(energy, 2));
+    await this.queue(Command.ApplyEnergy, intToBytes(1, 1));
+    if (this.options.lattice) {
+      await this.queue(Command.UpdateDevice, intToBytes(0, 1));
+      await this.queue(Command.Lattice, LATTICE_START);
+    }
+    if (this.options.startRetract! > 0) {
+      // Pull back the blank paper left over from the previous job's feed.
+      await this.queue(Command.Speed, intToBytes(8, 1));
+      await this.queue(
+        Command.Retract,
+        intToBytes(this.options.startRetract!, 2)
+      );
+      await this.queue(Command.Speed, intToBytes(speed, 1));
+    }
+    // Blank lines first: some printers drop the first rows of a job.
+    const blank = new Uint8Array(DEF_CANVAS_WIDTH / 8);
+    for (let i = 0; i < this.options.leadIn!; i++) {
+      await this.queue(Command.Bitmap, blank);
+    }
+    await this.flush();
   }
 
   /**
-   * Finish printing with an optional paper feed.
+   * Finish a print job: close the lattice and optionally feed paper.
    * @param feed The number of lines to feed at the end of printing. Default is 0.
    * @returns A Promise that resolves when the finish commands are sent.
    */
   async finish(feed: number = 0): Promise<void> {
-    if (feed > 0) {
-      await this.setSpeed(8); // Slower speed for final feed
-      await this.feed(feed);
+    await this.flush();
+    if (this.options.lattice) {
+      await this.queue(Command.Lattice, LATTICE_END);
     }
+    await this.queue(Command.Speed, intToBytes(8, 1)); // Slower speed for final feed
+    if (feed > 0) {
+      await this.queue(Command.Feed, intToBytes(feed, 2));
+    }
+    await this.queue(Command.GetDeviceState, intToBytes(0, 1));
+    await this.flush();
   }
 
   /**
    * Draw a single line of bitmap data to the printer.
-   * @param line The bitmap line data as a Uint8Array.
+   * @param line The bitmap line data as a Uint8Array (1 bit per pixel, LSB first).
    * @returns A Promise that resolves when the draw command is sent.
    * @throws Error if the printer is not connected.
    */
   async draw(line: Uint8Array): Promise<void> {
-    if (!this.isConnected()) {
-      throw new Error('Printer not connected');
-    }
-
-    const command = this.makeCommand(Command.Bitmap, line);
-    await this.write(command);
+    this.assertConnected();
+    await this.transmit(Command.Bitmap, line);
   }
 
   /**
    * Print a full bitmap.
+   * Blank rows at the top and bottom are trimmed; blank rows inside the image
+   * are printed so the image keeps its proportions. Lines are batched into
+   * MTU-sized chunks with a short pause between them so the printer's
+   * receive buffer is not overrun.
    * @param bitmap An object containing the width, height, and bitmap data.
-   * @returns A Promise that resolves when the entire bitmap is printed.
+   * @returns A Promise that resolves when the entire bitmap has been sent.
    */
   async printBitmap(bitmap: {
     width: number;
@@ -400,19 +405,126 @@ export class CatPrinter {
     const { width, height, data } = bitmap;
     const pitch = Math.ceil(width / 8); // Bytes per line
 
-    for (let y = 0; y < height; y++) {
-      const lineStart = y * pitch;
-      const lineEnd = lineStart + pitch;
-      const line = data.slice(lineStart, lineEnd);
+    const isBlank = (y: number): boolean => {
+      const start = y * pitch;
+      for (let i = start; i < start + pitch; i++) {
+        if (data[i] !== 0) return false;
+      }
+      return true;
+    };
 
-      // Skip empty lines (all zeros)
-      if (line.every(byte => byte === 0)) continue;
+    let first = 0;
+    while (first < height && isBlank(first)) first++;
+    let last = height - 1;
+    while (last > first && isBlank(last)) last--;
 
-      await this.draw(line);
+    for (let y = first; y <= last; y++) {
+      const line = data.subarray(y * pitch, (y + 1) * pitch);
+      await this.queue(Command.Bitmap, line);
     }
+
+    await this.flush();
+  }
+
+  /**
+   * Write every queued command to the printer.
+   * Waits while the printer reports that it is paused (its buffer is full).
+   * @returns A Promise that resolves when the queue is empty.
+   */
+  async flush(): Promise<void> {
+    if (this.pending.length === 0) return;
+
+    const chunk = new Uint8Array(this.pending);
+    this.pending = [];
+    await this.writeChunk(chunk);
   }
 
   // Private methods
+
+  /**
+   * Throw if the printer is not connected.
+   */
+  private assertConnected(): void {
+    if (!this.isConnected()) {
+      throw new Error('Printer not connected');
+    }
+  }
+
+  /**
+   * Queue a command. Commands are batched up to `mtu` bytes and written by
+   * {@link flush}. A command that does not fit in the current batch causes
+   * the batch to be written first.
+   * @param command The command to send.
+   * @param payload The data payload for the command.
+   */
+  private async queue(command: Command, payload: Uint8Array): Promise<void> {
+    await this.send(this.makeCommand(command, payload));
+  }
+
+  /**
+   * Queue a command and write it immediately.
+   * @param command The command to send.
+   * @param payload The data payload for the command.
+   */
+  private async transmit(command: Command, payload: Uint8Array): Promise<void> {
+    await this.queue(command, payload);
+    await this.flush();
+  }
+
+  /**
+   * Add a complete command packet to the outgoing queue.
+   * @param packet The command packet.
+   */
+  private async send(packet: Uint8Array): Promise<void> {
+    const mtu = Math.max(1, this.options.mtu!);
+
+    if (this.pending.length > 0 && this.pending.length + packet.length > mtu) {
+      await this.flush();
+    }
+
+    if (packet.length > mtu) {
+      // The printer parses a byte stream, so a packet larger than the MTU can
+      // be split at arbitrary boundaries.
+      for (let i = 0; i < packet.length; i += mtu) {
+        await this.writeChunk(packet.subarray(i, i + mtu));
+      }
+      return;
+    }
+
+    for (let i = 0; i < packet.length; i++) {
+      this.pending.push(packet[i]);
+    }
+  }
+
+  /**
+   * Write one chunk to the printer, honouring pause notifications and the
+   * configured delay between writes.
+   * @param chunk The bytes to write.
+   */
+  private async writeChunk(chunk: Uint8Array): Promise<void> {
+    await this.waitWhilePaused();
+    await this.write(chunk);
+    const pause = this.options.chunkDelay!;
+    if (pause > 0) {
+      await delay(pause);
+    }
+  }
+
+  /**
+   * Wait while the printer reports that it is paused.
+   * @throws Error if the printer stays paused longer than the timeout.
+   */
+  private async waitWhilePaused(): Promise<void> {
+    const start = Date.now();
+    while (this.printerState.paused) {
+      if (Date.now() - start > DEF_PAUSE_TIMEOUT) {
+        throw new Error(
+          'Printer stayed paused for too long (check paper and cover)'
+        );
+      }
+      await delay(100);
+    }
+  }
 
   /**
    * Create a command packet to send to the printer.
@@ -471,9 +583,14 @@ export class CatPrinter {
    */
   private handleNotification(event: Event): void {
     const target = event.target as BluetoothRemoteGATTCharacteristic;
-    if (!target.value) return;
+    const value = target.value;
+    if (!value) return;
 
-    const data = new Uint8Array(target.value.buffer);
+    const data = new Uint8Array(
+      value.buffer,
+      value.byteOffset,
+      value.byteLength
+    );
     this.log(
       'Received notification:',
       Array.from(data)
@@ -481,7 +598,7 @@ export class CatPrinter {
         .join(' ')
     );
 
-    // Handle printer state update
+    // Handle printer state update (also sent spontaneously as pause/resume)
     if (data.length >= 7 && data[2] === Command.GetDeviceState) {
       const state = data[6];
       this.printerState = {
@@ -495,6 +612,77 @@ export class CatPrinter {
 
       this.log('Printer state updated:', this.printerState);
     }
+  }
+
+  /**
+   * Feed or retract paper before printing an item.
+   * @param offset Lines to feed (positive) or retract (negative).
+   */
+  private async applyOffset(offset: number | undefined): Promise<void> {
+    if (!offset || offset === 0) return;
+
+    await this.setSpeed(8); // Slower speed for feeding
+    if (offset > 0) {
+      await this.feed(offset);
+    } else {
+      await this.retract(-offset);
+    }
+    await this.setSpeed(this.options.speed!);
+  }
+
+  /**
+   * Render and send text as part of an already prepared job.
+   * @param text The text to print.
+   * @param options Text formatting options.
+   */
+  private async printTextContent(
+    text: string,
+    options: TextOptions
+  ): Promise<void> {
+    const defaultOptions: TextOptions = {
+      fontFamily: 'sans-serif',
+      fontSize: 16,
+      align: 'start',
+      lineSpacing: 8,
+      rotate: 0,
+      flipH: false,
+      flipV: false,
+      brightness: 128,
+      offset: 0,
+    };
+
+    const mergedOptions = { ...defaultOptions, ...options };
+
+    const bitmapData = await this.textToBitmap(text, mergedOptions);
+
+    await this.applyOffset(mergedOptions.offset);
+    await this.printBitmap(bitmapData);
+  }
+
+  /**
+   * Render and send an image as part of an already prepared job.
+   * @param imageUrl The URL of the image to print.
+   * @param options Image formatting options.
+   */
+  private async printImageContent(
+    imageUrl: string,
+    options: ImageOptions
+  ): Promise<void> {
+    const defaultOptions: ImageOptions = {
+      dither: 'bayer', // Default to Bayer dithering as suggested
+      rotate: 0,
+      flipH: false,
+      flipV: false,
+      brightness: 128,
+      offset: 0,
+    };
+
+    const mergedOptions = { ...defaultOptions, ...options };
+
+    const bitmapData = await this.imageToBitmap(imageUrl, mergedOptions);
+
+    await this.applyOffset(mergedOptions.offset);
+    await this.printBitmap(bitmapData);
   }
 
   /**
@@ -649,7 +837,6 @@ export class CatPrinter {
 
     // Apply transformations if needed
     if (options.rotate !== 0 || options.flipH || options.flipV) {
-      // ... (transformation code remains the same)
       const transformCanvas = document.createElement('canvas');
       transformCanvas.width = canvas.width;
       transformCanvas.height = canvas.height;

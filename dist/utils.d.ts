@@ -14,3 +14,15 @@ export declare function crc8(data: Uint8Array): number;
  * @returns A Uint8Array representing the bitmap data.
  */
 export declare function rgbaToBits(rgba: Uint32Array, threshold?: number): Uint8Array;
+/**
+ * Encodes an integer as little-endian bytes.
+ * @param value The integer to encode. Values outside the range are clamped.
+ * @param length The number of bytes to produce. Default is 1.
+ * @returns The encoded bytes.
+ */
+export declare function intToBytes(value: number, length?: number): Uint8Array;
+/**
+ * Waits for the given number of milliseconds.
+ * @param ms The delay in milliseconds.
+ */
+export declare function delay(ms: number): Promise<void>;

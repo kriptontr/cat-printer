@@ -104,6 +104,11 @@ new CatPrinter(options?: PrinterOptions)
 | speed      | number  | 32      | Default print speed                     |
 | energy     | number  | 24000   | Default print energy/density            |
 | finishFeed | number  | 100     | Default lines to feed after printing    |
+| mtu        | number  | 200     | Max bytes per Bluetooth write (lower it, e.g. 20, if output is garbled) |
+| chunkDelay | number  | 20      | Pause in ms after every Bluetooth write |
+| leadIn     | number  | 16      | Blank lines printed at the start of every job (stops the top of the first item being cut off) |
+| lattice    | boolean | true    | Send the update-device and lattice start/end commands around each job (some printers, e.g. X5h, don't need them) |
+| startRetract | number | 0     | Lines to retract at the start of every job (takes back blank paper left by the previous job's feed) |
 
 ### Methods
 
@@ -124,13 +129,19 @@ new CatPrinter(options?: PrinterOptions)
 #### Printing Operations
 
 - **printText(text: string, options?: TextOptions): Promise<void>**  
-    Prints text with customizable formatting.
+    Prints text with customizable formatting. The printer is prepared before and finished (with `finishFeed`) after the text.
 
 - **printImage(imageUrl: string, options?: ImageOptions): Promise<void>**  
-    Prints an image using a specified dithering method.
+    Prints an image using a specified dithering method. The printer is prepared before and finished (with `finishFeed`) after the image.
 
 - **printMultiple(items: Array<{type: 'text' | 'image', content: string, options?: TextOptions | ImageOptions}>): Promise<void>**  
-    Prints multiple items in a queued sequence.
+    Prints multiple items as one job (a single prepare/finish around all items).
+
+- **printBitmap(bitmap: {width: number, height: number, data: Uint8Array}): Promise<void>**  
+    Sends a 1-bit bitmap (LSB first, `width` must be 384). Lines are batched into `mtu`-sized chunks with `chunkDelay` between them so the printer's buffer is never overrun.
+
+- **flush(): Promise<void>**  
+    Writes any queued commands to the printer immediately.
 
 #### Paper Control
 
@@ -149,10 +160,13 @@ new CatPrinter(options?: PrinterOptions)
     Adjusts the print energy/density.
 
 - **prepare(speed: number, energy: number): Promise<void>**  
-    Sets up both speed and energy simultaneously.
+    Starts a print job: queries state, sets DPI, speed and energy, and sends the "lattice start" sequence the printer expects before bitmap data.
 
 - **finish(feed: number): Promise<void>**  
-    Completes printing with a final paper feed.
+    Ends a print job: sends "lattice end", then feeds the paper.
+
+- **setDpi(), updateDevice(), startLattice(), endLattice(): Promise<void>**  
+    Low-level protocol commands used by `prepare`/`finish`; rarely needed directly.
 
 ### Options Types
 
